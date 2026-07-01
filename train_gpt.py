@@ -1227,7 +1227,7 @@ class GPT(nn.Module):
             self.vo_bank[:num_vo_real].uniform_(-bound, bound)
             self.vo_bank[num_vo_real:].zero_()
 
-    def init_mlp(self, model_dim):
+    def init_mlp(self, model_dim):        
         # MLP bank: stores c_fc and c_proj for all MLP layers
         # We add 1 padding layer (index 11) to get 12*2=24 matrices for even distribution across 8 GPUs
         mlp_hdim = 4 * model_dim
@@ -1329,6 +1329,19 @@ class GPT(nn.Module):
         x = (F.linear(x, self.mudd_w2[id, :num_coef]) + self.mudd_b2[id, :num_coef]) * self._mudd_scale
         return x.split(1, dim=-1)
 
+    def quantize_mlp_fp8(self):
+        """Refresh the FP8 copy of the MLP up-projection weights after optimizer steps."""
+        E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
+        with torch.no_grad():
+            if not hasattr(self, "_mlp_up_proj_f8"):
+                self._mlp_up_proj_f8 = torch.zeros_like(self.mlp_bank[:, 0], dtype=torch.float8_e4m3fn)
+                self._mlp_up_proj_scales = torch.ones(12, dtype=torch.float32, device=self.mlp_bank.device)
+                self._mlp_dequant_scale_buf = torch.ones(1, dtype=torch.float32, device=self.mlp_bank.device)
+            flat = self.mlp_bank[:, 0].view(12, -1)
+            scales = flat.abs().amax(dim=1).clamp(min=1e-12) / E4M3_MAX
+            self._mlp_up_proj_scales[:] = scales.float()
+            self._mlp_up_proj_f8[:] = (model.mlp_bank[:, 0] / scales.view(12, 1, 1)).to(torch.float8_e4m3fn)
+
     def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, bigram_input_seq: Tensor, schedule_cfg: ForwardScheduleConfig):
         assert input_seq.ndim == 1
 
@@ -1339,6 +1352,11 @@ class GPT(nn.Module):
         bm_sizes = [ws_short, ws_short, ws_short, ws_long, ws_short, ws_short, None, ws_short, ws_short, ws_short, ws_long]
         assert len(bm_sizes) == self.num_layers
         key_offset = [b==ws_long for b in bm_sizes] # apply partial key offset to long windows
+
+        use_mlp_fp8 = self.training and not os.environ.get("DISABLE_FP8", False)
+        if use_mlp_fp8:
+            mlp_up_proj_f8 = self._mlp_up_proj_f8.unbind(0)
+            mlp_up_proj_scales = [self._mlp_up_proj_scales[i:i+1] for i in range(12)]
 
         # ---- Unbind parameters (avoid select_backward kernels) ----
         sa_lambdas = self.scalars[: 2 * self.num_layers].view(-1, 2)
@@ -1405,9 +1423,11 @@ class GPT(nn.Module):
             attn = self.attn_paired if is_paired else self.attn
             c_fc = mlp_fcs[i]
             c_proj = mlp_projs[i]
+            if use_mlp_fp8:
+                up_proj_f8, up_proj_scale = mlp_up_proj_f8[i], mlp_up_proj_scales[i]
             mu = None
 
-            # Skip attention on layer 6 @YouJiacheng
+            # process attn. skip on layer 6 @YouJiacheng
             if i == 6:
                 x = x + skip_gate_out * cache[3]
             else:
@@ -1455,10 +1475,20 @@ class GPT(nn.Module):
                     if bg_inject[i] is not None:
                         x[..., :args.bigram_dim] = x[..., :args.bigram_dim] + bg_inject[i]
 
-            if mu is not None:
-                x = mu[12] * x + mu[13] * ReLUSqrdMLP(norm(x), c_fc, c_proj)
+            # process mlp
+            normed = norm(x)
+            if use_mlp_fp8:
+                amax = normed.detach().abs().max().clamp(min=1e-12)
+                x_f8 = (normed.detach() * (448.0 / amax)).to(torch.float8_e4m3fn)
+                self._mlp_dequant_scale_buf.copy_(up_proj_scale).mul_(amax).div_(448.0)
+                mlp_args = (c_fc, c_proj, up_proj_f8, self._mlp_dequant_scale_buf, x_f8)
             else:
-                x = resid_lambdas_mlp[i] * x + post_lambdas_mlp[i] * ReLUSqrdMLP(norm(x), c_fc, c_proj)
+                mlp_args = (c_fc, c_proj)
+
+            if mu is not None:
+                x = mu[12] * x + mu[13] * ReLUSqrdMLP(normed, *mlp_args)
+            else:
+                x = resid_lambdas_mlp[i] * x + post_lambdas_mlp[i] * ReLUSqrdMLP(normed, *mlp_args)
 
             if i in self.cache_layers:
                 cache[i] = x
@@ -1675,7 +1705,7 @@ class Hyperparameters:
     # batch sizes
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule
-    num_scheduled_iterations: int = 1375  # number of steps to complete lr and ws schedule
+    num_scheduled_iterations: int = 1380  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 10  # number of steps to continue training at final lr and ws
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
@@ -2035,6 +2065,7 @@ model.mudd_b2.data = model.mudd_b2.data.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 dist.broadcast(model.bigram_sign_table, 0)  # buffer, not in parameters()
+model.quantize_mlp_fp8()
 
 model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 training_manager = TrainingManager(model)
@@ -2070,11 +2101,13 @@ for step in warmup_steps:
         loss.backward()
         del loss
     training_manager.step_optimizers(step)
+    model.quantize_mlp_fp8()
 print0("Resetting Model", console=True)
 model.zero_grad(set_to_none=True)
 model.load_state_dict(initial_state["model"])
 training_manager.reset(initial_state["optimizer"])
 del val_loader, train_loader, initial_state
+model.quantize_mlp_fp8()
 model.train()
 
 ########################################
@@ -2135,6 +2168,7 @@ for step in range(train_steps + 1):
         loss.backward()
         del loss
     training_manager.step_optimizers(step)
+    model.quantize_mlp_fp8()
 
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
